@@ -1,0 +1,208 @@
+name: CI
+
+# Gatilho: todo Pull Request para a main, alem de push na main (pos-merge).
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+# Um push novo no mesmo PR cancela a execucao anterior: nao faz sentido
+# gastar runner validando um commit que ja foi substituido.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24'
+
+jobs:
+  qualidade:
+    name: 1. Analise estatica e formatacao
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Prettier (formatacao)
+        run: npm run format:check
+
+      - name: ESLint (analise estatica)
+        run: npm run lint
+
+      - name: TypeScript (checagem de tipos)
+        run: npm run typecheck
+
+  build:
+    name: 2. Build
+    needs: qualidade
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Gerar bundle de producao
+        run: npm run build
+
+      - name: Resumo do bundle
+        run: |
+          echo '### Bundle de producao' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          du -sh dist >> "$GITHUB_STEP_SUMMARY"
+          find dist -type f | sort >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar artefato do build
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ github.sha }}
+          path: dist
+          retention-days: 7
+
+  testes:
+    name: 3. Testes unitarios e de integracao
+    needs: qualidade
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Testes unitarios
+        run: npm run test:unit -- --reporter=default --reporter=junit --outputFile.junit=reports/junit-unit.xml
+
+      - name: Testes de integracao
+        run: npm run test:integration -- --reporter=default --reporter=junit --outputFile.junit=reports/junit-integration.xml
+
+      - name: Cobertura (falha se abaixo do threshold)
+        run: npm run test:coverage
+
+      - name: Resumo da cobertura
+        run: node scripts/resumo-cobertura.mjs
+
+      - name: Publicar relatorios de teste e cobertura
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: relatorios-testes-${{ github.sha }}
+          path: |
+            reports
+            coverage
+          retention-days: 7
+
+  imagem:
+    name: 4. Imagem Docker
+    needs: [build, testes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Construir imagem
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: |
+            ci-webapp-demo:${{ github.sha }}
+            ci-webapp-demo:pr-${{ github.event.pull_request.number || 'main' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Smoke test do container
+        run: |
+          set -euo pipefail
+          docker run -d --name app -p 3000:3000 ci-webapp-demo:"$GITHUB_SHA"
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3000/api/health >/dev/null; then
+              echo "Container saudavel apos ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          echo "--- /api/health ---"
+          curl -fsS http://localhost:3000/api/health
+          echo
+          echo "--- / (HTML servido) ---"
+          curl -fsS http://localhost:3000/ | head -c 200
+          echo
+          echo "--- logs do container ---"
+          docker logs app
+          docker rm -f app
+
+      - name: Resumo da imagem
+        run: |
+          IMAGEM="ci-webapp-demo:$GITHUB_SHA"
+          TAMANHO_BYTES=$(docker image inspect "$IMAGEM" --format '{{.Size}}')
+          TAMANHO_MB=$((TAMANHO_BYTES / 1024 / 1024))
+          DIGEST=$(docker image inspect "$IMAGEM" --format '{{index .RepoDigests 0}}' || echo 'local (sem push)')
+          docker image history "$IMAGEM" --format '{{.CreatedBy}}' | head -n 5 > /tmp/historico.txt
+          {
+            echo '### Imagem construida'
+            echo ''
+            echo "| Campo | Valor |"
+            echo "| --- | --- |"
+            echo "| Tag | \`$IMAGEM\` |"
+            echo "| Tamanho | ${TAMANHO_MB} MB |"
+            echo "| Digest | \`$DIGEST\` |"
+            echo ''
+            echo '<details><summary>Ultimas camadas</summary>'
+            echo ''
+            echo '```'
+            cat /tmp/historico.txt
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Exportar imagem como artefato
+        run: |
+          docker save "ci-webapp-demo:$GITHUB_SHA" | gzip > imagem-ci-webapp-demo.tar.gz
+
+      - name: Publicar imagem
+        uses: actions/upload-artifact@v7
+        with:
+          name: imagem-docker-${{ github.sha }}
+          path: imagem-ci-webapp-demo.tar.gz
+          compression-level: 0
+          retention-days: 7
