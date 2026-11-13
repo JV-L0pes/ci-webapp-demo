@@ -5,9 +5,10 @@ import type { Produto } from '../src/api.ts'
 export const catalogo: Produto[] = [
   { id: 'p1', nome: 'Clean Code', categoria: 'livros', precoCentavos: 9_900 },
   { id: 'p2', nome: 'The Pragmatic Programmer', categoria: 'livros', precoCentavos: 12_500 },
-  { id: 'p3', nome: 'Teclado mecÃ¢nico', categoria: 'eletronicos', precoCentavos: 34_900 },
+  { id: 'p3', nome: 'Teclado mecânico', categoria: 'eletronicos', precoCentavos: 34_900 },
   { id: 'p4', nome: 'Monitor 27"', categoria: 'eletronicos', precoCentavos: 189_900 },
-  { id: 'p5', nome: 'Caneca tÃ©rmica', categoria: 'casa', precoCentavos: 4_500 },
+  { id: 'p5', nome: 'Caneca térmica', categoria: 'casa', precoCentavos: 4_500 },
+  { id: 'p6', nome: 'Mouse ergonômico', categoria: 'eletronicos', precoCentavos: 15_900 },
 ]
 
 export function criarApp() {
